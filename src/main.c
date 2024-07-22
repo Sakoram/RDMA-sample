@@ -41,7 +41,7 @@
 #include <signal.h>
 #include <time.h>
 
-#define TARGET_FPS 1
+#define TARGET_FPS 30
 #define NANOSECONDS_IN_SECOND 1000000000
 #define DESIRED_FRAME_DURATION (NANOSECONDS_IN_SECOND / TARGET_FPS)
 
@@ -50,6 +50,8 @@ FILE* yuv_file;
 size_t frame_size;
 static atomic_bool keep_running = true;
 struct timespec start_time, current_time;
+int frame_count = 0;
+static int offset_rma_start = 0;
 
 static SDL_Window* window = NULL;
 static SDL_Renderer* renderer = NULL;
@@ -62,7 +64,7 @@ int sdl_init(size_t width, size_t height) {
   }
 
   window = SDL_CreateWindow("RDMA Frame Display", SDL_WINDOWPOS_UNDEFINED,
-                            SDL_WINDOWPOS_UNDEFINED, 1920, 1080, SDL_WINDOW_SHOWN);
+                            SDL_WINDOWPOS_UNDEFINED, 426, 240, SDL_WINDOW_SHOWN);
   if (!window) {
     printf("Window could not be created! SDL_Error: %s\n", SDL_GetError());
     return -1;
@@ -100,31 +102,36 @@ void sdl_cleanup() {
   SDL_Quit();
 }
 
-int ft_send_frame(struct fid_ep *ep)
+int ft_send_frame(struct fid_ep *ep, struct fi_rma_iov *remote)
 {
 	int ret;
-	fprintf(stdout, "Sending frame...\n");
 
-	if (opts.iface == FI_HMEM_SYSTEM) {
-		// snprintf(tx_buf, tx_size, "%s", greeting);
-		while (fread(tx_buf, 1, frame_size, yuv_file) != frame_size) {
-			if (feof(yuv_file)) {
-				/* restart from the beginning if the end of file is reached */
-				fseek(yuv_file, 0, SEEK_SET);
-				continue;
-			} else {
-				printf("Failed to read frame from file\n");
-				return -1;
-			}
+	// snprintf(tx_buf + offset_rma_start, tx_size, "%s", greeting);
+	while (fread(tx_buf + offset_rma_start, 1, frame_size, yuv_file) != frame_size) {
+		if (feof(yuv_file)) {
+			/* restart from the beginning if the end of file is reached */
+			fseek(yuv_file, 0, SEEK_SET);
+			continue;
+		} else {
+			printf("Failed to read frame from file\n");
+			return -1;
 		}
 	}
 
-	ret = ft_post_tx(ep, remote_fi_addr, frame_size, NO_CQ_DATA, &tx_ctx);
+	ft_sync();
+	fprintf(stdout, "Sending frame...\n");
+
+	ret = ft_post_rma(FT_RMA_WRITEDATA,
+			tx_buf + offset_rma_start,
+			opts.transfer_size,
+			remote,	&tx_ctx);
 	if (ret)
 		return ret;
 
 	ret = ft_get_tx_comp(tx_seq);
-	return ret;
+	if (ret)
+		return ret;
+	// ft_rx(ep, FT_RMA_SYNC_MSG_BYTES); // do I need this? from bw_tx_comp()
 
 	fprintf(stdout, "Send completion received\n");
 	return 0;
@@ -134,27 +141,37 @@ int ft_recv_frame(struct fid_ep *ep)
 {
 	int ret;
 	double elapsed_time;
-	int frame_count = 0;
 	double fps = 0.0;
 
-	fprintf(stdout, "Waiting for message from client...\n");
-	ret = ft_get_rx_comp(rx_seq);
+	ft_sync();
+	// fprintf(stdout, "Waiting for message from client...\n");
+
+
+	if (fi->rx_attr->mode & FI_RX_CQ_DATA)
+		ret = ft_post_rx(ep, 0, &rx_ctx);
+	else
+		/* Just increment the seq # instead of
+			* posting recv so that we wait for
+			* remote write completion on the next
+			* iteration */
+		rx_seq++;
+
+	/* rx_seq is always one ahead */
+	ret = ft_get_rx_comp(rx_seq - 1);
 	if (ret)
 		return ret;
 
-	// sdl_display_frame(rx_buf, 1920, 1080);
+	sdl_display_frame(rx_buf + offset_rma_start, 1920, 1080);
 
-	ret = ft_post_rx(ep, rx_size, &rx_ctx);
-	if (ret)
-		return ret;
 
 	frame_count++;
 	clock_gettime(CLOCK_MONOTONIC, &current_time);
 	elapsed_time = current_time.tv_sec - start_time.tv_sec;
 	elapsed_time += (current_time.tv_nsec - start_time.tv_nsec) / 1000000000.0;
 
-	if (elapsed_time >= 5.0) {
+	if (elapsed_time >= 2.0) {
 		fps = frame_count / elapsed_time;
+		printf("frame_count: %d\n", frame_count);
 		printf("FPS: %.2f\n", fps);
 		frame_count = 0;
 		clock_gettime(CLOCK_MONOTONIC, &start_time);
@@ -165,41 +182,51 @@ int ft_recv_frame(struct fid_ep *ep)
 	return 0;
 }
 
-static void control_fps(struct timespec* start_time) {
-  struct timespec end_time;
-  long long elapsed_time, time_to_wait;
+// static void control_fps(struct timespec* start_time) {
+//   struct timespec end_time;
+//   long long elapsed_time, time_to_wait;
 
-  clock_gettime(CLOCK_MONOTONIC, &end_time);
+//   clock_gettime(CLOCK_MONOTONIC, &end_time);
 
-  elapsed_time = (end_time.tv_sec - start_time->tv_sec) * NANOSECONDS_IN_SECOND +
-                 (end_time.tv_nsec - start_time->tv_nsec);
-  time_to_wait = DESIRED_FRAME_DURATION - elapsed_time;
+//   elapsed_time = (end_time.tv_sec - start_time->tv_sec) * NANOSECONDS_IN_SECOND +
+//                  (end_time.tv_nsec - start_time->tv_nsec);
+//   time_to_wait = DESIRED_FRAME_DURATION - elapsed_time;
 
-  if (time_to_wait > 0) {
-    struct timespec sleep_time;
-    sleep_time.tv_sec = time_to_wait / NANOSECONDS_IN_SECOND;
-    sleep_time.tv_nsec = time_to_wait % NANOSECONDS_IN_SECOND;
-    nanosleep(&sleep_time, NULL);
-  }
+//   if (time_to_wait > 0) {
+//     struct timespec sleep_time;
+//     sleep_time.tv_sec = time_to_wait / NANOSECONDS_IN_SECOND;
+//     sleep_time.tv_nsec = time_to_wait % NANOSECONDS_IN_SECOND;
+//     nanosleep(&sleep_time, NULL);
+//   }
 
-  clock_gettime(CLOCK_MONOTONIC, start_time);
-}
+//   clock_gettime(CLOCK_MONOTONIC, start_time);
+// }
 
 
 static int run(void)
 {
 	int ret;
 
-	if (!opts.dst_addr) {
-		ret = ft_start_server();
-		if (ret)
-			return ret;
-	}
+	if (hints->ep_attr->type == FI_EP_MSG) {
+		if (!opts.dst_addr) {
+			ret = ft_start_server();
+			if (ret)
+				return ret;
+		}
 
-	ret = opts.dst_addr ? ft_client_connect() : ft_server_connect();
-	if (ret) {
-		return ret;
+		ret = opts.dst_addr ? ft_client_connect() : ft_server_connect();
+	} else {
+		ret = ft_init_fabric();
 	}
+	if (ret)
+		return ret;
+
+	ret = ft_exchange_keys(&remote);
+	if (ret)
+		return ret;
+
+	offset_rma_start = FT_RMA_SYNC_MSG_BYTES +
+			   MAX(ft_tx_prefix_size(), ft_rx_prefix_size());
 
 	// ret = ft_send_recv_greeting(ep);
 	if (opts.dst_addr) {
@@ -209,8 +236,11 @@ static int run(void)
 			return -1;
 		}
 		while (keep_running) {
-			ft_send_frame(ep);
-			control_fps(&start_time);
+			ret = ft_send_frame(ep, &remote);
+			if (ret) {
+				return ret;
+			}
+			// control_fps(&start_time);
 		}
 	} else {
 		if (sdl_init(1920, 1080) != 0) {
@@ -227,7 +257,7 @@ static int run(void)
 	}
 
 
-	fi_shutdown(ep, 0);
+	ft_finalize();
 	return ret;
 }
 
@@ -236,51 +266,79 @@ static int run(void)
 //   keep_running = false;
 // }
 
+
+
+
+	// signal(SIGINT, int_handler);
+
 int main(int argc, char **argv)
 {
 	int op, ret;
 
-	// signal(SIGINT, int_handler);
-
 	opts = INIT_OPTS;
-	opts.options |= FT_OPT_SIZE;
+	opts.options |= FT_OPT_BW;
 
 	frame_size = 1920 * 1080; // * 2; /* UYVY */
 	frame_size = frame_size + (frame_size / 2); // SDL_PIXELFORMAT_YV12
 	opts.transfer_size = frame_size;
 
 
-
-
 	hints = fi_allocinfo();
 	if (!hints)
 		return EXIT_FAILURE;
 
-	while ((op = getopt(argc, argv, "h" ADDR_OPTS INFO_OPTS)) != -1) {
+	opts.rma_op = FT_RMA_WRITEDATA;
+	hints->fabric_attr->prov_name = strdup("verbs");
+	// hints->ep_attr->type = FI_EP_MSG;  // makes performance worst
+
+	hints->caps = FI_MSG | FI_RMA;
+	hints->domain_attr->resource_mgmt = FI_RM_ENABLED;
+	hints->mode = FI_CONTEXT;
+	hints->domain_attr->threading = FI_THREAD_DOMAIN;
+	hints->addr_format = opts.address_format;
+
+	while ((op = getopt_long(argc, argv, "Uh" CS_OPTS INFO_OPTS API_OPTS
+			    /*BENCHMARK_OPTS*/, long_opts, &lopt_idx)) != -1) {
 		switch (op) {
 		default:
-			ft_parse_addr_opts(op, optarg, &opts);
+			if (!ft_parse_long_opts(op, optarg))
+				continue;
+			// ft_parse_benchmark_opts(op, optarg);
 			ft_parseinfo(op, optarg, hints, &opts);
+			ft_parsecsopts(op, optarg, &opts);
+			ret = ft_parse_api_opts(op, optarg, hints, &opts);
+			if (ret)
+				return ret;
+			break;
+		case 'U':
+			hints->tx_attr->op_flags |= FI_DELIVERY_COMPLETE;
 			break;
 		case '?':
 		case 'h':
-			ft_usage(argv[0], "A simple MSG client-sever example.");
+			ft_csusage(argv[0], "Bandwidth test using RMA operations.");
+			//ft_benchmark_usage();
+			FT_PRINT_OPTS_USAGE("-o <op>", "rma op type: read|write|"
+					"writedata (default: write)\n");
+			fprintf(stderr, "Note: read/write bw tests are bidirectional.\n"
+					"      writedata bw test is unidirectional"
+					" from the client side.\n");
+			ft_longopts_usage();
 			return EXIT_FAILURE;
 		}
 	}
 
+	/* data validation on read and write ops requires delivery_complete semantics. */
+	if (opts.rma_op != FT_RMA_WRITEDATA && ft_check_opts(FT_OPT_VERIFY_DATA))
+		hints->tx_attr->op_flags |= FI_DELIVERY_COMPLETE;
+
 	if (optind < argc)
 		opts.dst_addr = argv[optind];
 
-	hints->ep_attr->type		= FI_EP_MSG;
-	hints->caps			= FI_MSG;
-	hints->domain_attr->mr_mode 	= opts.mr_mode;
-	hints->addr_format		= opts.address_format;
+	hints->domain_attr->mr_mode = opts.mr_mode;
+	hints->tx_attr->tclass = FI_TC_BULK_DATA;
 
-	clock_gettime(CLOCK_MONOTONIC, &start_time);
 	ret = run();
-	printf("EXIT\n");
 
 	ft_free_res();
-	return ft_exit_code(ret);
+	return -ret;
 }
